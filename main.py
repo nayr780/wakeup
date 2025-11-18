@@ -53,6 +53,10 @@ SAVER_DELAY = 2
 MAX_RETRIES_PER_RUN = 8         # número total de tentativas por execução
 RETRIES_PER_PROXY = 2           # quantas vezes repetir cada proxy antes de trocar
 
+# Job fixo de keep-alive
+KEEPALIVE_URL = "https://wakeupaaa.vercel.app/logs"
+KEEPALIVE_INTERVAL = 60
+
 # Webshare
 WEBSHARE_API_KEY = "x23fqlzsqjpru7fhr4fpt6rpe7x0dostf1l0dhfi"
 WEBSHARE_URL = "https://proxy.webshare.io/api/v2/proxy/list/"
@@ -138,6 +142,30 @@ def atomic_write(path, obj):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
+
+def merge_proxies(existing, extras):
+    # Unifica por (host,port,username,password)
+    seen = set()
+    out = []
+    for src in (existing, extras):
+        for p in src:
+            key = (p.get("proxy_address"), p.get("port"), p.get("username"), p.get("password"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+    return out
+
+def fetch_webshare_list():
+    r = requests.get(
+        WEBSHARE_URL,
+        headers={"Authorization": f"Token {WEBSHARE_API_KEY}"},
+        params={"mode": "direct", "page_size": 50},
+        timeout=30
+    )
+    r.raise_for_status()
+    js = r.json()
+    return js.get("results", [])
 
 def load_all():
     global data
@@ -251,30 +279,6 @@ def build_proxy_url(p):
 def proxies_for_requests(p):
     url = build_proxy_url(p)
     return {"http": url, "https": url}
-
-def merge_proxies(existing, extras):
-    # Unifica por (host,port,username,password)
-    seen = set()
-    out = []
-    for src in (existing, extras):
-        for p in src:
-            key = (p.get("proxy_address"), p.get("port"), p.get("username"), p.get("password"))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(p)
-    return out
-
-def fetch_webshare_list():
-    r = requests.get(
-        WEBSHARE_URL,
-        headers={"Authorization": f"Token {WEBSHARE_API_KEY}"},
-        params={"mode": "direct", "page_size": 50},
-        timeout=30
-    )
-    r.raise_for_status()
-    js = r.json()
-    return js.get("results", [])
 
 def append_log(entry):
     with SCHED_LOCK:
@@ -421,6 +425,59 @@ def saver_loop():
         if time.time() - last >= SAVER_DELAY:
             save_all()
             last = time.time()
+
+# ======================
+# Boot helpers
+# ======================
+
+def ensure_bootstrap_items():
+    """
+    - Atualiza as proxies (best-effort)
+    - Garante que exista SEMPRE um job para KEEPALIVE_URL a cada 60s
+    """
+    # 1) Atualiza proxies primeiro
+    try:
+        res = fetch_webshare_list()
+        for p in res:
+            p["source"] = "webshare"
+        with POOL_LOCK:
+            data["proxies"] = merge_proxies(data["proxies"], res)
+        mark_dirty("proxies")
+        print(f"[boot] proxies atualizadas. Total: {len(data['proxies'])}")
+    except Exception as e:
+        print(f"[boot] falha ao atualizar proxies: {e}")
+
+    # 2) Garante job de keep-alive
+    with SCHED_LOCK:
+        keepalive_tid = None
+        for tid, t in data["tasks"].items():
+            if t.get("url") == KEEPALIVE_URL:
+                keepalive_tid = tid
+                # ajusta para garantir config que você pediu
+                t.setdefault("name", "Wakeup Vercel /logs")
+                t["interval"] = KEEPALIVE_INTERVAL
+                t.setdefault("timeout", DEFAULT_TIMEOUT)
+                t["enabled"] = True
+                if not t.get("next_run"):
+                    t["next_run"] = now_iso()
+                break
+
+        if not keepalive_tid:
+            tid = str(uuid.uuid4())
+            data["tasks"][tid] = {
+                "id": tid,
+                "name": "Wakeup Vercel /logs",
+                "url": KEEPALIVE_URL,
+                "interval": KEEPALIVE_INTERVAL,
+                "timeout": DEFAULT_TIMEOUT,
+                "enabled": True,
+                "last_status": None,
+                "last_error": None,
+                "last_run": None,
+                "next_run": now_iso(),
+            }
+            print(f"[boot] job keep-alive criado ({KEEPALIVE_URL} a cada {KEEPALIVE_INTERVAL}s)")
+        mark_dirty("tasks")
 
 # ======================
 # Templates
@@ -582,7 +639,6 @@ FORM = f"""
   <a class="btn btn-secondary" href="{{{{ url_for('index') }}}}">Cancelar</a>
 </form>
 """
-
 
 LOGS = """
 <h3>Logs</h3>
@@ -832,6 +888,7 @@ app.add_url_rule("/set_default/<proxy_id>", view_func=set_default_proxy, methods
 
 def boot():
     load_all()
+    ensure_bootstrap_items()  # proxies primeiro, depois garante 1 job fixo
     ensure_next_run_all()
 
 if __name__ == "__main__":
