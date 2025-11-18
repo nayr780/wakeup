@@ -3,7 +3,7 @@
 """
 Proxy Cron Manager (UI simples) — sem campos de proxy no formulário
 - Login com proteção de brute-force e rate-limit leve
-- Dashboard lista proxies disponíveis (estáticos + Webshare API)
+- Dashboard lista proxies disponíveis (Webshare API)
 - Jobs: Nome, URL, Intervalo (padrão 180s)
 - Runner: retries até HTTP 200 alternando proxies (usa 'padrão' primeiro)
 - Ao obter 200, salva o proxy vencedor como padrão
@@ -61,40 +61,6 @@ KEEPALIVE_INTERVAL = 60
 WEBSHARE_API_KEY = "x23fqlzsqjpru7fhr4fpt6rpe7x0dostf1l0dhfi"
 WEBSHARE_URL = "https://proxy.webshare.io/api/v2/proxy/list/"
 
-# Proxies estáticos — exatamente os que você passou
-STATIC_PROXIES = [
-    {
-        "id": "d-16691384278",
-        "username": "oavaoscn",
-        "password": "fv3hgjiyqne5",
-        "proxy_address": "216.10.27.159",
-        "port": 6837,
-        "country_code": "US",
-        "city_name": "Dallas",
-        "source": "static"
-    },
-    {
-        "id": "d-17150545792",
-        "username": "oavaoscn",
-        "password": "fv3hgjiyqne5",
-        "proxy_address": "142.111.67.146",
-        "port": 5611,
-        "country_code": "JP",
-        "city_name": "Tokyo",
-        "source": "static"
-    },
-    {
-        "id": "6641",
-        "username": "oavaoscn",
-        "password": "fv3hgjiyqne5",
-        "proxy_address": "216.10.27.159",
-        "port": 6837,
-        "country_code": "ES",
-        "city_name": "Madrid",
-        "source": "static"
-    },
-]
-
 DATA_FILE = "data.json"
 
 # ======================
@@ -116,7 +82,7 @@ data = {
         "default_proxy_id": None,
         "user_agent": "ProxyCron/1.0"
     },
-    "proxies": []      # lista unificada (static + webshare)
+    "proxies": []      # lista (apenas Webshare)
 }
 
 _tasks_dirty = False
@@ -170,23 +136,21 @@ def fetch_webshare_list():
 def load_all():
     global data
     if not os.path.exists(DATA_FILE):
-        # inicializa com estáticos
-        data["proxies"] = merge_proxies([], STATIC_PROXIES)
+        # começa sem proxies; boot vai puxar da Webshare
+        data["proxies"] = []
         save_all(force=True)
         return
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             loaded = json.load(f)
-            # merge seguro com defaults
             data["tasks"] = loaded.get("tasks", {})
             data["logs"] = loaded.get("logs", [])
             data["settings"] = loaded.get("settings", {"default_proxy_id": None, "user_agent": "ProxyCron/1.0"})
-            # proxies: manter os salvos + garantir estáticos
             saved_proxies = loaded.get("proxies", [])
-            data["proxies"] = merge_proxies(saved_proxies, STATIC_PROXIES)
+            data["proxies"] = saved_proxies
     except Exception:
-        # se der problema, recomeça com estáticos
-        data["proxies"] = merge_proxies([], STATIC_PROXIES)
+        # se der problema, recomeça vazio; boot atualiza via Webshare
+        data["proxies"] = []
         save_all(force=True)
 
 def save_all(force=False):
@@ -432,7 +396,7 @@ def saver_loop():
 
 def ensure_bootstrap_items():
     """
-    - Atualiza as proxies (best-effort)
+    - Atualiza as proxies (best-effort, Webshare)
     - Garante que exista SEMPRE um job para KEEPALIVE_URL a cada 60s
     """
     # 1) Atualiza proxies primeiro
@@ -453,8 +417,7 @@ def ensure_bootstrap_items():
         for tid, t in data["tasks"].items():
             if t.get("url") == KEEPALIVE_URL:
                 keepalive_tid = tid
-                # ajusta para garantir config que você pediu
-                t.setdefault("name", "Wakeup Vercel /logs")
+                t.setdefault("name", "Wakeup /logs")
                 t["interval"] = KEEPALIVE_INTERVAL
                 t.setdefault("timeout", DEFAULT_TIMEOUT)
                 t["enabled"] = True
@@ -466,7 +429,7 @@ def ensure_bootstrap_items():
             tid = str(uuid.uuid4())
             data["tasks"][tid] = {
                 "id": tid,
-                "name": "Wakeup Vercel /logs",
+                "name": "Wakeup /logs",
                 "url": KEEPALIVE_URL,
                 "interval": KEEPALIVE_INTERVAL,
                 "timeout": DEFAULT_TIMEOUT,
@@ -582,7 +545,7 @@ INDEX = """
 <hr class="my-4">
 
 <h3>Proxies disponíveis</h3>
-<p class="text-muted">A execução usa a proxy padrão (se houver) e depois alterna entre as demais, com retries. Ao conseguir 200, a vencedora vira padrão.</p>
+<p class="text-muted">Lista puxada da Webshare. A execução usa a proxy padrão (se houver) e depois alterna entre as demais, com retries. Ao conseguir 200, a vencedora vira padrão.</p>
 
 <table class="table table-sm table-bordered">
   <thead><tr><th>Padrão?</th><th>ID</th><th>Host:Port</th><th>User</th><th>País/Cidade</th><th>Fonte</th><th>Ação</th></tr></thead>
@@ -848,7 +811,7 @@ def refresh_proxies():
     if request.method == "GET":
         body = """
         <h3>Atualizar Proxies (Webshare)</h3>
-        <p>Busca via API e mescla com seus estáticos. Tudo salvo em <code>data.json</code> (um arquivo apenas).</p>
+        <p>Busca via API e mescla com a lista atual. Tudo salvo em <code>data.json</code> (um arquivo apenas).</p>
         <form method="post"><button class="btn btn-primary">Atualizar agora</button>
         <a class="btn btn-secondary" href="{{ url_for('index') }}">Voltar</a></form>
         """
@@ -888,7 +851,7 @@ app.add_url_rule("/set_default/<proxy_id>", view_func=set_default_proxy, methods
 
 def boot():
     load_all()
-    ensure_bootstrap_items()  # proxies primeiro, depois garante 1 job fixo
+    ensure_bootstrap_items()  # proxies primeiro, depois garante job fixo
     ensure_next_run_all()
 
 if __name__ == "__main__":
