@@ -54,7 +54,7 @@ MAX_RETRIES_PER_RUN = 8         # número total de tentativas por execução
 RETRIES_PER_PROXY = 2           # quantas vezes repetir cada proxy antes de trocar
 
 # Job fixo de keep-alive
-KEEPALIVE_URL = "https://wakeupaaa.vercel.app/logs"
+KEEPALIVE_URL = "https://wakeup-61e8.onrender.com/logs"
 KEEPALIVE_INTERVAL = 60
 
 # Webshare
