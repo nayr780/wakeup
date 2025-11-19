@@ -32,12 +32,13 @@ from concurrent.futures import ThreadPoolExecutor
 # CONFIG (via ambiente)
 # ======================
 
-# Leitura de secrets / config sensível
 ADMIN_USER = os.environ.get("ADMIN_USER")
 ADMIN_PASSWORD_PLAIN = os.environ.get("ADMIN_PASSWORD")
 SESSION_SECRET = os.environ.get("SESSION_SECRET")
 WEBSHARE_API_KEY = os.environ.get("WEBSHARE_API_KEY")
-KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL")
+
+raw = os.environ.get("KEEPALIVE_URLS", "")
+KEEPALIVE_URLS = [u.strip() for u in raw.split(",") if u.strip()]
 
 _missing_env = [
     name for name, val in [
@@ -45,10 +46,11 @@ _missing_env = [
         ("ADMIN_PASSWORD", ADMIN_PASSWORD_PLAIN),
         ("SESSION_SECRET", SESSION_SECRET),
         ("WEBSHARE_API_KEY", WEBSHARE_API_KEY),
-        ("KEEPALIVE_URL", KEEPALIVE_URL),
     ]
     if not val
 ]
+if not KEEPALIVE_URLS:
+    _missing_env.append("KEEPALIVE_URLS")
 
 if _missing_env:
     raise RuntimeError(
@@ -56,32 +58,35 @@ if _missing_env:
         + ", ".join(_missing_env)
     )
 
-# Gera o hash da senha a partir da senha em texto do ambiente
 ADMIN_PASSWORD_HASH = generate_password_hash(ADMIN_PASSWORD_PLAIN)
 
-# Anti brute-force / rate-limit
+# Job fixo de keep-alive (intervalo padrão)
+KEEPALIVE_INTERVAL = int(os.environ.get("KEEPALIVE_INTERVAL", 60))
+
+# ————————————————
+# constantes de execução
+DEFAULT_INTERVAL = 180
+DEFAULT_TIMEOUT = 15
+MAX_WORKERS = 20
+CHECK_INTERVAL = 1
+SAVER_DELAY = 2
+MAX_RETRIES_PER_RUN = 8
+RETRIES_PER_PROXY = 2
+# ————————————————
+
+# anti brute-force / rate-limit
 MAX_LOGIN_FAILS = 5
 LOCKOUT_MINUTES = 15
 GLOBAL_RATE_WINDOW_SEC = 60
 GLOBAL_MAX_REQ_PER_IP = 120
 LOGIN_RATE_MAX_PER_IP = 10
 
-# Execução
-DEFAULT_INTERVAL = 180
-DEFAULT_TIMEOUT = 15
-MAX_WORKERS = 20
-CHECK_INTERVAL = 1
-SAVER_DELAY = 2
-MAX_RETRIES_PER_RUN = 8         # número total de tentativas por execução
-RETRIES_PER_PROXY = 2           # quantas vezes repetir cada proxy antes de trocar
-
-# Job fixo de keep-alive (URL vem de env)
-KEEPALIVE_INTERVAL = 60
 
 # Webshare
 WEBSHARE_URL = "https://proxy.webshare.io/api/v2/proxy/list/"
 
 DATA_FILE = "data.json"
+
 
 # ======================
 # App & Estados
@@ -417,7 +422,7 @@ def saver_loop():
 def ensure_bootstrap_items():
     """
     - Atualiza as proxies (best-effort, Webshare)
-    - Garante que exista SEMPRE um job para KEEPALIVE_URL a cada 60s
+    - Garante job de keep-alive para **cada** URL em KEEPALIVE_URLS
     """
     # 1) Atualiza proxies primeiro
     try:
@@ -427,40 +432,37 @@ def ensure_bootstrap_items():
         with POOL_LOCK:
             data["proxies"] = merge_proxies(data["proxies"], res)
         mark_dirty("proxies")
-        print(f"[boot] proxies atualizadas. Total: {len(data['proxies'])}")
     except Exception as e:
         print(f"[boot] falha ao atualizar proxies: {e}")
 
-    # 2) Garante job de keep-alive
+    # 2) Garante job(s) de keep-alive
     with SCHED_LOCK:
-        keepalive_tid = None
-        for tid, t in data["tasks"].items():
-            if t.get("url") == KEEPALIVE_URL:
-                keepalive_tid = tid
-                t.setdefault("name", "Wakeup /logs")
-                t["interval"] = KEEPALIVE_INTERVAL
-                t.setdefault("timeout", DEFAULT_TIMEOUT)
-                t["enabled"] = True
-                if not t.get("next_run"):
-                    t["next_run"] = now_iso()
-                break
-
-        if not keepalive_tid:
-            tid = str(uuid.uuid4())
-            data["tasks"][tid] = {
-                "id": tid,
-                "name": "Wakeup /logs",
-                "url": KEEPALIVE_URL,
-                "interval": KEEPALIVE_INTERVAL,
-                "timeout": DEFAULT_TIMEOUT,
-                "enabled": True,
-                "last_status": None,
-                "last_error": None,
-                "last_run": None,
-                "next_run": now_iso(),
-            }
-            print(f"[boot] job keep-alive criado ({KEEPALIVE_URL} a cada {KEEPALIVE_INTERVAL}s)")
+        for url in KEEPALIVE_URLS:
+            existing = next((t for t in data["tasks"].values() if t.get("url") == url), None)
+            if existing:
+                # atualiza config do job existente
+                existing["interval"] = KEEPALIVE_INTERVAL
+                existing["enabled"] = True
+                existing.setdefault("name", f"Keepalive {url}")
+                existing.setdefault("timeout", DEFAULT_TIMEOUT)
+                existing.setdefault("next_run", now_iso())
+            else:
+                # cria novo job
+                tid = str(uuid.uuid4())
+                data["tasks"][tid] = {
+                    "id": tid,
+                    "name": f"Keepalive {url}",
+                    "url": url,
+                    "interval": KEEPALIVE_INTERVAL,
+                    "timeout": DEFAULT_TIMEOUT,
+                    "enabled": True,
+                    "last_status": None,
+                    "last_error": None,
+                    "last_run": None,
+                    "next_run": now_iso(),
+                }
         mark_dirty("tasks")
+
 
 # ======================
 # Templates
