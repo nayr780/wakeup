@@ -8,7 +8,7 @@ Proxy Cron Manager (UI simples) — sem campos de proxy no formulário
 - Runner: retries até HTTP 200 alternando proxies (usa 'padrão' primeiro)
 - Ao obter 200, salva o proxy vencedor como padrão
 - Persistência em UM arquivo: data.json (tasks, logs, proxies, settings)
-- Sem .env (API key e secrets no código, altere antes de produção)
+- Secrets (login, sessão, Webshare, keep-alive) vêm de variáveis de ambiente
 """
 
 import os
@@ -29,13 +29,35 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from concurrent.futures import ThreadPoolExecutor
 
 # ======================
-# CONFIG (edite aqui)
+# CONFIG (via ambiente)
 # ======================
 
-# Login admin
-ADMIN_USER = "admin"
-ADMIN_PASSWORD_HASH = generate_password_hash("troque-esta-senha!")  # mude a senha!
-SESSION_SECRET = "mude-este-secret-para-um-bem-grande-e-aleatorio"
+# Leitura de secrets / config sensível
+ADMIN_USER = os.environ.get("ADMIN_USER")
+ADMIN_PASSWORD_PLAIN = os.environ.get("ADMIN_PASSWORD")
+SESSION_SECRET = os.environ.get("SESSION_SECRET")
+WEBSHARE_API_KEY = os.environ.get("WEBSHARE_API_KEY")
+KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL")
+
+_missing_env = [
+    name for name, val in [
+        ("ADMIN_USER", ADMIN_USER),
+        ("ADMIN_PASSWORD", ADMIN_PASSWORD_PLAIN),
+        ("SESSION_SECRET", SESSION_SECRET),
+        ("WEBSHARE_API_KEY", WEBSHARE_API_KEY),
+        ("KEEPALIVE_URL", KEEPALIVE_URL),
+    ]
+    if not val
+]
+
+if _missing_env:
+    raise RuntimeError(
+        "Variáveis de ambiente obrigatórias ausentes: "
+        + ", ".join(_missing_env)
+    )
+
+# Gera o hash da senha a partir da senha em texto do ambiente
+ADMIN_PASSWORD_HASH = generate_password_hash(ADMIN_PASSWORD_PLAIN)
 
 # Anti brute-force / rate-limit
 MAX_LOGIN_FAILS = 5
@@ -53,12 +75,10 @@ SAVER_DELAY = 2
 MAX_RETRIES_PER_RUN = 8         # número total de tentativas por execução
 RETRIES_PER_PROXY = 2           # quantas vezes repetir cada proxy antes de trocar
 
-# Job fixo de keep-alive
-KEEPALIVE_URL = "https://wakeup-61e8.onrender.com/logs"
+# Job fixo de keep-alive (URL vem de env)
 KEEPALIVE_INTERVAL = 60
 
 # Webshare
-WEBSHARE_API_KEY = "x23fqlzsqjpru7fhr4fpt6rpe7x0dostf1l0dhfi"
 WEBSHARE_URL = "https://proxy.webshare.io/api/v2/proxy/list/"
 
 DATA_FILE = "data.json"
@@ -523,7 +543,7 @@ INDEX = """
       <td>{{ t.get('next_run') }}</td>
       <td>
         <form style="display:inline" method="post" action="{{ url_for('test', tid=tid) }}">
-          <button class="btn btn-sm btn-outline-primary">Test</button>
+          <button class="btn btn-sm btn_outline-primary btn btn-sm btn-outline-primary">Test</button>
         </form>
         <a class="btn btn-sm btn-warning" href="{{ url_for('edit', tid=tid) }}">Editar</a>
         <form style="display:inline" method="post" action="{{ url_for('toggle', tid=tid) }}">
