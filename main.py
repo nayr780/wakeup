@@ -3,12 +3,17 @@
 """
 Proxy Cron Manager (UI simples) — sem campos de proxy no formulário
 - Login com proteção de brute-force e rate-limit leve
-- Dashboard lista proxies disponíveis (Webshare API)
+- Dashboard lista proxies disponíveis (Webshare API) de múltiplas API keys
 - Jobs: Nome, URL, Intervalo (padrão 180s)
 - Runner: retries até HTTP 200 alternando proxies (usa 'padrão' primeiro)
 - Ao obter 200, salva o proxy vencedor como padrão
 - Persistência em UM arquivo: data.json (tasks, logs, proxies, settings)
 - Secrets (login, sessão, Webshare, keep-alive) vêm de variáveis de ambiente
+
+NOVO:
+- Suporte a DUAS API keys da Webshare (WEBSHARE_API_KEY_1 e WEBSHARE_API_KEY_2)
+- Mostra na UI de qual conta/key veio cada proxy
+- Se detectar "Bandwidth limit reached" (HTTP 402), pula o restante daquela key/conta
 """
 
 import os
@@ -35,7 +40,16 @@ from concurrent.futures import ThreadPoolExecutor
 ADMIN_USER = os.environ.get("ADMIN_USER")
 ADMIN_PASSWORD_PLAIN = os.environ.get("ADMIN_PASSWORD")
 SESSION_SECRET = os.environ.get("SESSION_SECRET")
-WEBSHARE_API_KEY = os.environ.get("WEBSHARE_API_KEY")
+
+# Suporte novo: 2 chaves. Compatível com legado (WEBSHARE_API_KEY)
+WEBSHARE_API_KEY_1 = os.environ.get("WEBSHARE_API_KEY_1") or os.environ.get("WEBSHARE_API_KEY")
+WEBSHARE_API_KEY_2 = os.environ.get("WEBSHARE_API_KEY_2")
+
+WEBSHARE_ACCOUNTS = []
+if WEBSHARE_API_KEY_1:
+    WEBSHARE_ACCOUNTS.append({"label": "webshare-1", "token": WEBSHARE_API_KEY_1})
+if WEBSHARE_API_KEY_2:
+    WEBSHARE_ACCOUNTS.append({"label": "webshare-2", "token": WEBSHARE_API_KEY_2})
 
 raw = os.environ.get("KEEPALIVE_URLS", "")
 KEEPALIVE_URLS = [u.strip() for u in raw.split(",") if u.strip()]
@@ -45,10 +59,11 @@ _missing_env = [
         ("ADMIN_USER", ADMIN_USER),
         ("ADMIN_PASSWORD", ADMIN_PASSWORD_PLAIN),
         ("SESSION_SECRET", SESSION_SECRET),
-        ("WEBSHARE_API_KEY", WEBSHARE_API_KEY),
     ]
     if not val
 ]
+if not WEBSHARE_ACCOUNTS:
+    _missing_env.append("WEBSHARE_API_KEY_1 (ou WEBSHARE_API_KEY) / WEBSHARE_API_KEY_2")
 if not KEEPALIVE_URLS:
     _missing_env.append("KEEPALIVE_URLS")
 
@@ -81,7 +96,6 @@ GLOBAL_RATE_WINDOW_SEC = 60
 GLOBAL_MAX_REQ_PER_IP = 120
 LOGIN_RATE_MAX_PER_IP = 10
 
-
 # Webshare
 WEBSHARE_URL = "https://proxy.webshare.io/api/v2/proxy/list/"
 
@@ -107,7 +121,7 @@ data = {
         "default_proxy_id": None,
         "user_agent": "ProxyCron/1.0"
     },
-    "proxies": []      # lista (apenas Webshare)
+    "proxies": []      # lista (Webshare múltiplas contas)
 }
 
 _tasks_dirty = False
@@ -125,6 +139,11 @@ fail_by_user = defaultdict(lambda: deque())
 ip_lockouts = {}
 user_lockouts = {}
 
+
+# ======================
+# Utils
+# ======================
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -134,34 +153,87 @@ def atomic_write(path, obj):
         json.dump(obj, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
 
+def proxy_unique_key(p):
+    # Unifica por endpoint + credenciais + origem da conta (importante para duas keys)
+    return (
+        p.get("proxy_address"),
+        p.get("port"),
+        p.get("username"),
+        p.get("password"),
+        p.get("account_label"),
+    )
+
+def proxy_display_id(p):
+    # ID estável local caso Webshare não retorne id
+    wid = p.get("id")
+    if wid:
+        return str(wid)
+    base = f"{p.get('proxy_address')}:{p.get('port')}"
+    acct = p.get("account_label", "unknown")
+    return f"{acct}|{base}"
+
 def merge_proxies(existing, extras):
-    # Unifica por (host,port,username,password)
-    seen = set()
-    out = []
+    """
+    Unifica por endpoint+credenciais+account_label.
+    Preserva dados novos quando houver conflito.
+    """
+    merged = {}
     for src in (existing, extras):
         for p in src:
-            key = (p.get("proxy_address"), p.get("port"), p.get("username"), p.get("password"))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(p)
+            k = proxy_unique_key(p)
+            if k in merged:
+                merged[k].update({kk: vv for kk, vv in p.items() if vv is not None})
+            else:
+                merged[k] = dict(p)
+    out = list(merged.values())
+    # ordenação estável para UI
+    out.sort(key=lambda p: (
+        p.get("account_label", ""),
+        str(p.get("country_code", "")),
+        str(p.get("city_name", "")),
+        str(p.get("proxy_address", "")),
+        str(p.get("port", "")),
+    ))
     return out
 
-def fetch_webshare_list():
+def normalize_webshare_proxy(p, account_label):
+    q = dict(p)
+    q["source"] = "webshare"
+    q["account_label"] = account_label
+    q["provider_key"] = account_label
+    q["id"] = q.get("id") or proxy_display_id({**q, "account_label": account_label})
+    return q
+
+def fetch_webshare_list_for_account(account):
     r = requests.get(
         WEBSHARE_URL,
-        headers={"Authorization": f"Token {WEBSHARE_API_KEY}"},
+        headers={"Authorization": f"Token {account['token']}"},
         params={"mode": "direct", "page_size": 50},
         timeout=30
     )
     r.raise_for_status()
     js = r.json()
-    return js.get("results", [])
+    rows = js.get("results", [])
+    return [normalize_webshare_proxy(p, account["label"]) for p in rows]
+
+def fetch_all_webshare_lists():
+    """
+    Busca proxies de todas as keys configuradas.
+    Não aborta geral se uma falhar.
+    """
+    all_proxies = []
+    errors = []
+    for account in WEBSHARE_ACCOUNTS:
+        try:
+            rows = fetch_webshare_list_for_account(account)
+            all_proxies.extend(rows)
+        except Exception as e:
+            errors.append(f"{account['label']}: {e}")
+    return all_proxies, errors
 
 def load_all():
     global data
     if not os.path.exists(DATA_FILE):
-        # começa sem proxies; boot vai puxar da Webshare
         data["proxies"] = []
         save_all(force=True)
         return
@@ -171,10 +243,8 @@ def load_all():
             data["tasks"] = loaded.get("tasks", {})
             data["logs"] = loaded.get("logs", [])
             data["settings"] = loaded.get("settings", {"default_proxy_id": None, "user_agent": "ProxyCron/1.0"})
-            saved_proxies = loaded.get("proxies", [])
-            data["proxies"] = saved_proxies
+            data["proxies"] = loaded.get("proxies", [])
     except Exception:
-        # se der problema, recomeça vazio; boot atualiza via Webshare
         data["proxies"] = []
         save_all(force=True)
 
@@ -221,7 +291,6 @@ def client_ip():
 def rate_limit_check(is_login=False):
     ip = client_ip()
     now = time.time()
-    # lockout?
     if ip in ip_lockouts and ip_lockouts[ip] > now:
         abort(429, "IP temporariamente bloqueado")
     q = login_hits[ip] if is_login else ip_hits[ip]
@@ -233,14 +302,16 @@ def rate_limit_check(is_login=False):
 
 def register_login_failure(ip, username):
     now = time.time()
-    fq_ip = fail_by_ip[ip]; fq_user = fail_by_user[username]
-    hits_prune(fq_ip, LOCKOUT_MINUTES*60)
-    hits_prune(fq_user, LOCKOUT_MINUTES*60)
-    fq_ip.append(now); fq_user.append(now)
+    fq_ip = fail_by_ip[ip]
+    fq_user = fail_by_user[username]
+    hits_prune(fq_ip, LOCKOUT_MINUTES * 60)
+    hits_prune(fq_user, LOCKOUT_MINUTES * 60)
+    fq_ip.append(now)
+    fq_user.append(now)
     if len(fq_ip) >= MAX_LOGIN_FAILS:
-        ip_lockouts[ip] = now + LOCKOUT_MINUTES*60
+        ip_lockouts[ip] = now + LOCKOUT_MINUTES * 60
     if len(fq_user) >= MAX_LOGIN_FAILS:
-        user_lockouts[username] = now + LOCKOUT_MINUTES*60
+        user_lockouts[username] = now + LOCKOUT_MINUTES * 60
 
 def login_blocked(ip, username):
     now = time.time()
@@ -277,60 +348,115 @@ def append_log(entry):
     mark_dirty("logs")
 
 def rotate_default_proxy(proxy_id):
-    # Marca um proxy como padrão
     data["settings"]["default_proxy_id"] = proxy_id
     mark_dirty("settings")
 
 def pick_attempt_order():
-    """Define a ordem de tentativas: padrão -> demais; pode repetir proxies."""
+    """
+    Ordem: padrão -> demais.
+    Repetição por proxy.
+    """
     with POOL_LOCK:
         proxies = list(data["proxies"])
     default_id = data["settings"].get("default_proxy_id")
+
     ordered = []
     if default_id:
-        ordered.extend([p for p in proxies if p.get("id") == default_id])
-        ordered.extend([p for p in proxies if p.get("id") != default_id])
+        ordered.extend([p for p in proxies if str(p.get("id")) == str(default_id)])
+        ordered.extend([p for p in proxies if str(p.get("id")) != str(default_id)])
     else:
         ordered = proxies
 
-    # constrói lista expandida com repetições
     expanded = []
     for p in ordered:
         for _ in range(RETRIES_PER_PROXY):
             expanded.append(p)
     return expanded
 
+def is_bandwidth_exhausted_response(resp):
+    """
+    Detecta bloqueio de banda de proxy (ex.: Webshare).
+    """
+    if resp is None:
+        return False
+    if resp.status_code != 402:
+        return False
+    try:
+        body = (resp.text or "")[:300].lower()
+    except Exception:
+        body = ""
+    return "bandwidth limit reached" in body or "upgrade to continue using the proxy" in body
+
+def short_resp_body(resp, n=160):
+    try:
+        return (resp.text or "")[:n].replace("\n", " ").strip()
+    except Exception:
+        return ""
+
 def run_http_with_failover(url, timeout_s, user_agent):
     tried = []
     errors = []
     headers = {"User-Agent": user_agent}
 
+    # Se uma key estourar banda, pulamos todas proxies dessa key nessa execução
+    exhausted_accounts = set()
+
     plan = pick_attempt_order()
-    # corta no máx MAX_RETRIES_PER_RUN
     plan = plan[:MAX_RETRIES_PER_RUN] if MAX_RETRIES_PER_RUN > 0 else plan
 
     for i, p in enumerate(plan, start=1):
-        tag = f"{p.get('proxy_address')}:{p.get('port')}"
+        account_label = p.get("account_label", "unknown")
+        if account_label in exhausted_accounts:
+            errors.append(f"try#{i} skip={account_label} bandwidth_exhausted")
+            continue
+
+        tag = f"{p.get('proxy_address')}:{p.get('port')}[{account_label}]"
         tried.append(tag)
+
         try:
-            resp = requests.get(url, headers=headers, proxies=proxies_for_requests(p), timeout=timeout_s)
+            resp = requests.get(
+                url,
+                headers=headers,
+                proxies=proxies_for_requests(p),
+                timeout=timeout_s
+            )
+
             if resp.status_code == 200:
-                return {"status": 200, "body_snippet": resp.text[:500], "tried": tried}, p
-            else:
-                errors.append(f"try#{i} status={resp.status_code}")
+                return {
+                    "status": 200,
+                    "body_snippet": resp.text[:500],
+                    "tried": tried,
+                    "winner_account": account_label
+                }, p
+
+            if is_bandwidth_exhausted_response(resp):
+                exhausted_accounts.add(account_label)
+                errors.append(
+                    f"try#{i} status=402 bandwidth_exhausted account={account_label} "
+                    f"body={short_resp_body(resp)}"
+                )
+                continue
+
+            errors.append(
+                f"try#{i} status={resp.status_code} account={account_label} body={short_resp_body(resp)}"
+            )
+
         except Exception as e:
-            errors.append(f"try#{i} err={str(e)[:120]}")
+            errors.append(f"try#{i} err={str(e)[:140]} account={account_label}")
 
     # última carta: sem proxy
     try:
         resp = requests.get(url, headers=headers, timeout=timeout_s)
         if resp.status_code == 200:
-            res = {"status": 200, "body_snippet": resp.text[:500], "tried": tried, "note": "sem proxy"}
-            return res, None
-        else:
-            errors.append(f"direct status={resp.status_code}")
+            return {
+                "status": 200,
+                "body_snippet": resp.text[:500],
+                "tried": tried,
+                "note": "sem proxy"
+            }, None
+        errors.append(f"direct status={resp.status_code} body={short_resp_body(resp)}")
     except Exception as e:
-        errors.append(f"direct err={str(e)[:120]}")
+        errors.append(f"direct err={str(e)[:140]}")
 
     return {"error": "; ".join(errors), "tried": tried}, None
 
@@ -355,7 +481,7 @@ def run_task(tid, is_test=False):
                 data["tasks"][tid]["last_status"] = 200
                 data["tasks"][tid]["last_error"] = None
                 if good_proxy:
-                    rotate_default_proxy(good_proxy.get("id") or f"{good_proxy.get('proxy_address')}:{good_proxy.get('port')}")
+                    rotate_default_proxy(str(good_proxy.get("id") or proxy_display_id(good_proxy)))
             else:
                 data["tasks"][tid]["last_status"] = None
                 data["tasks"][tid]["last_error"] = result.get("error")
@@ -393,7 +519,6 @@ def scheduler_loop():
                         nxt_ts = now_ts
                     if nxt_ts <= now_ts:
                         due.append(tid)
-                        # agenda próxima já para evitar dupla execução
                         interval = max(1, int(t.get("interval", DEFAULT_INTERVAL)))
                         nr = datetime.now(timezone.utc) + timedelta(seconds=interval)
                         t["next_run"] = nr.isoformat()
@@ -415,39 +540,45 @@ def saver_loop():
             save_all()
             last = time.time()
 
+
 # ======================
 # Boot helpers
 # ======================
 
+def refresh_proxies_from_all_accounts():
+    """
+    Atualiza proxies via todas as keys e mescla com o pool atual.
+    """
+    rows, errs = fetch_all_webshare_lists()
+    if rows:
+        with POOL_LOCK:
+            data["proxies"] = merge_proxies(data["proxies"], rows)
+        mark_dirty("proxies")
+    return rows, errs
+
 def ensure_bootstrap_items():
     """
-    - Atualiza as proxies (best-effort, Webshare)
-    - Garante job de keep-alive para **cada** URL em KEEPALIVE_URLS
+    - Atualiza as proxies (best-effort, Webshare de 1..N keys)
+    - Garante job de keep-alive para cada URL
     """
-    # 1) Atualiza proxies primeiro
     try:
-        res = fetch_webshare_list()
-        for p in res:
-            p["source"] = "webshare"
-        with POOL_LOCK:
-            data["proxies"] = merge_proxies(data["proxies"], res)
-        mark_dirty("proxies")
+        rows, errs = refresh_proxies_from_all_accounts()
+        print(f"[boot] proxies carregadas: {len(rows)}")
+        if errs:
+            print("[boot] falhas em algumas keys:", " | ".join(errs))
     except Exception as e:
         print(f"[boot] falha ao atualizar proxies: {e}")
 
-    # 2) Garante job(s) de keep-alive
     with SCHED_LOCK:
         for url in KEEPALIVE_URLS:
             existing = next((t for t in data["tasks"].values() if t.get("url") == url), None)
             if existing:
-                # atualiza config do job existente
                 existing["interval"] = KEEPALIVE_INTERVAL
                 existing["enabled"] = True
                 existing.setdefault("name", f"Keepalive {url}")
                 existing.setdefault("timeout", DEFAULT_TIMEOUT)
                 existing.setdefault("next_run", now_iso())
             else:
-                # cria novo job
                 tid = str(uuid.uuid4())
                 data["tasks"][tid] = {
                     "id": tid,
@@ -538,14 +669,14 @@ INDEX = """
           <span class="badge bg-success">{{ t.get('last_status') }}</span>
         {% elif t.get('last_error') %}
           <span class="badge bg-danger">ERR</span>
-          <div style="font-size:.8em">{{ t.get('last_error')[:80] }}</div>
+          <div style="font-size:.8em">{{ t.get('last_error')[:120] }}</div>
         {% else %}-{% endif %}
         <div style="font-size:.75em;color:#666">{{ t.get('last_run') }}</div>
       </td>
       <td>{{ t.get('next_run') }}</td>
       <td>
         <form style="display:inline" method="post" action="{{ url_for('test', tid=tid) }}">
-          <button class="btn btn-sm btn_outline-primary btn btn-sm btn-outline-primary">Test</button>
+          <button class="btn btn-sm btn-outline-primary">Test</button>
         </form>
         <a class="btn btn-sm btn-warning" href="{{ url_for('edit', tid=tid) }}">Editar</a>
         <form style="display:inline" method="post" action="{{ url_for('toggle', tid=tid) }}">
@@ -567,16 +698,31 @@ INDEX = """
 <hr class="my-4">
 
 <h3>Proxies disponíveis</h3>
-<p class="text-muted">Lista puxada da Webshare. A execução usa a proxy padrão (se houver) e depois alterna entre as demais, com retries. Ao conseguir 200, a vencedora vira padrão.</p>
+<p class="text-muted">
+  Lista puxada da Webshare (múltiplas API keys). A execução usa a proxy padrão e faz failover.
+  Se uma conta retornar 402 (Bandwidth limit reached), o runner pula as demais proxies daquela conta nessa execução.
+</p>
 
 <table class="table table-sm table-bordered">
-  <thead><tr><th>Padrão?</th><th>ID</th><th>Host:Port</th><th>User</th><th>País/Cidade</th><th>Fonte</th><th>Ação</th></tr></thead>
+  <thead>
+    <tr>
+      <th>Padrão?</th>
+      <th>ID</th>
+      <th>Conta/Key</th>
+      <th>Host:Port</th>
+      <th>User</th>
+      <th>País/Cidade</th>
+      <th>Fonte</th>
+      <th>Ação</th>
+    </tr>
+  </thead>
   <tbody>
     {% for p in proxies %}
-      {% set is_default = (p.get('id') == default_id) %}
+      {% set is_default = (p.get('id')|string == default_id|string) %}
       <tr class="{{ 'table-success' if is_default else '' }}">
         <td>{{ '✅' if is_default else '' }}</td>
-        <td>{{ p.get('id') }}</td>
+        <td style="font-size:.85em">{{ p.get('id') }}</td>
+        <td><span class="badge bg-secondary">{{ p.get('account_label','-') }}</span></td>
         <td>{{ p.get('proxy_address') }}:{{ p.get('port') }}</td>
         <td>{{ p.get('username') }}</td>
         <td>{{ p.get('country_code','') }}/{{ p.get('city_name','') }}</td>
@@ -642,6 +788,9 @@ LOGS = """
             {% if ent.result.status %}
               <span class="badge bg-success">{{ ent.result.status }}</span>
               <div style="font-size:.85em">{{ ent.result.duration_s }}s</div>
+              {% if ent.result.winner_account %}
+                <div style="font-size:.85em;color:#444">Conta vencedora: <b>{{ ent.result.winner_account }}</b></div>
+              {% endif %}
               <pre style="white-space:pre-wrap">{{ ent.result.body_snippet }}</pre>
             {% elif ent.result.error %}
               <span class="badge bg-danger">ERR</span>
@@ -683,6 +832,7 @@ LOGIN = """
 </div>
 """
 
+
 # ======================
 # Rotas
 # ======================
@@ -699,23 +849,29 @@ def login():
     if request.method == "GET":
         body = render_template_string(LOGIN)
         return render_template_string(BASE, body=body, get_flashed_messages=get_flashed_messages)
+
     ip = client_ip()
     username = (request.form.get("username") or "").strip()
     password = request.form.get("password") or ""
+
     if login_blocked(ip, username):
         time.sleep(1.0)
         flash("Acesso temporariamente bloqueado. Tente mais tarde.")
         return redirect(url_for("login"))
+
     ok = (username == ADMIN_USER) and check_password_hash(ADMIN_PASSWORD_HASH, password)
     if not ok:
         register_login_failure(ip, username)
         time.sleep(0.7)
         flash("Usuário ou senha inválidos")
         return redirect(url_for("login"))
+
     session.clear()
     session["auth_user"] = ADMIN_USER
-    fail_by_ip[ip].clear(); fail_by_user[username].clear()
-    ip_lockouts.pop(ip, None); user_lockouts.pop(username, None)
+    fail_by_ip[ip].clear()
+    fail_by_user[username].clear()
+    ip_lockouts.pop(ip, None)
+    user_lockouts.pop(username, None)
     return redirect(request.args.get("next") or url_for("index"))
 
 @app.route("/logout")
@@ -756,8 +912,8 @@ def create():
         mark_dirty("tasks")
         flash("Job criado")
         return redirect(url_for("index"))
-    t = {}
-    body = render_template_string(FORM, title="Criar job", t=t)
+
+    body = render_template_string(FORM, title="Criar job", t={})
     return render_template_string(BASE, body=body, get_flashed_messages=get_flashed_messages)
 
 @app.route("/edit/<tid>", methods=["GET", "POST"])
@@ -768,6 +924,7 @@ def edit(tid):
     if not t:
         flash("Job não encontrado")
         return redirect(url_for("index"))
+
     if request.method == "POST":
         with SCHED_LOCK:
             data["tasks"][tid]["name"] = request.form.get("name", "").strip()
@@ -779,6 +936,7 @@ def edit(tid):
         mark_dirty("tasks")
         flash("Job atualizado")
         return redirect(url_for("index"))
+
     body = render_template_string(FORM, title="Editar job", t=t)
     return render_template_string(BASE, body=body, get_flashed_messages=get_flashed_messages)
 
@@ -833,20 +991,21 @@ def refresh_proxies():
     if request.method == "GET":
         body = """
         <h3>Atualizar Proxies (Webshare)</h3>
-        <p>Busca via API e mescla com a lista atual. Tudo salvo em <code>data.json</code> (um arquivo apenas).</p>
-        <form method="post"><button class="btn btn-primary">Atualizar agora</button>
-        <a class="btn btn-secondary" href="{{ url_for('index') }}">Voltar</a></form>
+        <p>Busca via API em todas as API keys configuradas e mescla com a lista atual. Tudo salvo em <code>data.json</code>.</p>
+        <form method="post">
+          <button class="btn btn-primary">Atualizar agora</button>
+          <a class="btn btn-secondary" href="{{ url_for('index') }}">Voltar</a>
+        </form>
         """
         body = render_template_string(body)
         return render_template_string(BASE, body=body, get_flashed_messages=get_flashed_messages)
+
     try:
-        res = fetch_webshare_list()
-        for p in res:
-            p["source"] = "webshare"
-        with POOL_LOCK:
-            data["proxies"] = merge_proxies(data["proxies"], res)
-        mark_dirty("proxies")
-        flash(f"Proxylist atualizada. Total: {len(data['proxies'])}.")
+        rows, errs = refresh_proxies_from_all_accounts()
+        msg = f"Proxylist atualizada. Novas/mescladas: {len(rows)}. Total salvo: {len(data['proxies'])}."
+        if errs:
+            msg += " Falhas parciais: " + " | ".join(errs)
+        flash(msg)
     except Exception as e:
         flash(f"Erro ao atualizar proxies: {e}")
     return redirect(url_for("index"))
@@ -854,18 +1013,17 @@ def refresh_proxies():
 @app.route("/admin/set_default/<proxy_id>", methods=["POST"])
 @login_required
 def set_default_proxy(proxy_id):
-    # só define se existir
     with POOL_LOCK:
-        if any(p.get("id") == proxy_id for p in data["proxies"]):
-            rotate_default_proxy(proxy_id)
+        if any(str(p.get("id")) == str(proxy_id) for p in data["proxies"]):
+            rotate_default_proxy(str(proxy_id))
             flash(f"Padrão definido: {proxy_id}")
         else:
             flash("Proxy não encontrada")
     return redirect(url_for("index"))
 
 # alias amigável
-set_default_proxy.methods = ["POST"]
 app.add_url_rule("/set_default/<proxy_id>", view_func=set_default_proxy, methods=["POST"])
+
 
 # ======================
 # Boot
@@ -873,7 +1031,7 @@ app.add_url_rule("/set_default/<proxy_id>", view_func=set_default_proxy, methods
 
 def boot():
     load_all()
-    ensure_bootstrap_items()  # proxies primeiro, depois garante job fixo
+    ensure_bootstrap_items()
     ensure_next_run_all()
 
 if __name__ == "__main__":
